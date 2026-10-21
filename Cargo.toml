@@ -1,7 +1,11 @@
 [package]
 name = "my-term-mux"
-version = "0.1.0"
-edition = "2021"
+version = "0.0.3"
+edition = "2026"
+description = "Минималистичный терминальный мультиплексор на Rust"
+license = "MIT"
+repository = "https://github.com/Blentazerd/my-term-mux"
+readme = "README.md"
 
 [dependencies]
 # Основной фреймворк для TUI
