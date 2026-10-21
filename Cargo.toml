@@ -3,7 +3,7 @@ name = "cmdnest"
 version = "0.3.0"
 edition = "2021"
 description = "Минималистичный и удобный терминальный мультиплексор"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/Blentazerd/cmdnest"
 readme = "README.md"
 

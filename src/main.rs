@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Blentazerd
+//
+// CmdNest — минималистичный терминальный мультиплексор.
+// Распространяется под GNU Affero General Public License v3.0 или новее.
+// Полный текст — в файле LICENSE в корне проекта.
+
+
 use std::{
     io::{Read, Write},
     sync::{Arc, Mutex},
