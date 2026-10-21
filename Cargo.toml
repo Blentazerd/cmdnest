@@ -1,10 +1,10 @@
 [package]
-name = "my-term-mux"
-version = "0.0.3"
+name = "cmdnest"
+version = "0.0.1"
 edition = "2026"
-description = "Минималистичный терминальный мультиплексор на Rust"
+description = "Минималистичный и удобный терминальный мультиплексор"
 license = "MIT"
-repository = "https://github.com/Blentazerd/my-term-mux"
+repository = "https://github.com/Blentazerd/cmdnest"
 readme = "README.md"
 
 [dependencies]
@@ -16,3 +16,7 @@ crossterm = "0.28"
 portable-pty = "0.8"
 # Парсер ANSI-последовательностей (превращает "сырой" вывод в сетку символов)
 vt100 = "0.15"
+
+[[bin]]
+name = "CmdNest"
+path = "src/main.rs"

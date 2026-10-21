@@ -1,4 +1,4 @@
-# my-term-mux
+# CmdNest
 
 Минималистичный терминальный мультиплексор на Rust (в разработке).
 
@@ -13,8 +13,8 @@
 - Rust (`sudo pacman -S rust cargo`)
 
 ## Сборка и запуск
-git clone https://github.com/ТВОЙ_НИК/my-term-mux.git
-cd my-term-mux
+git clone https://github.com/Blentazerd/cmdnest.git
+cd cmdnest
 cargo run --release
 
 ## Управление
