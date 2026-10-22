@@ -1,4 +1,6 @@
-use crossterm::event::{self, KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Rect, Size};
 
 use crate::layout::{find_neighbor, Layout, NavDir, SplitDir};
@@ -180,17 +182,39 @@ KeyCode::Char('x') => {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        let tab = self.current_tab_mut();
-        if tab.focused >= tab.panes.len() {
-            return;
+
+pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    // 1. Клик левой кнопкой — найти панель под курсором и переключить на неё фокус
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        let area = self.main_area;
+        let rects = self.current_tab().pane_rects(area);
+
+        // Перебираем все панели: если точка клика попадает в прямоугольник — фокус туда
+        for (idx, rect) in &rects {
+            let inside_x = mouse.column >= rect.x && mouse.column < rect.x + rect.width;
+            let inside_y = mouse.row >= rect.y && mouse.row < rect.y + rect.height;
+            if inside_x && inside_y {
+                self.current_tab_mut().focused = *idx;
+                return;
+            }
         }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => tab.panes[tab.focused].scroll_up(3),
-            MouseEventKind::ScrollDown => tab.panes[tab.focused].scroll_down(3),
-            _ => {}
-        }
+        // Клик мимо панелей (статус-бар, за пределами) — ничего не делаем
+        return;
     }
+
+    // 2. Скролл — применяется к активной (focused) панели
+    let focused = self.current_tab().focused;
+    let tab = self.current_tab_mut();
+    if focused >= tab.panes.len() {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp => tab.panes[focused].scroll_up(3),
+        MouseEventKind::ScrollDown => tab.panes[focused].scroll_down(3),
+        _ => {}
+    }
+}
+
 
     pub fn handle_resize(&mut self, cols: u16, rows: u16) {
         self.main_area = Rect::new(0, 0, cols, rows.saturating_sub(1));
