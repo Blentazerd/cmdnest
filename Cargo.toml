@@ -1,6 +1,6 @@
 [package]
 name = "cmdnest"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Минималистичный и удобный терминальный мультиплексор"
 license = "AGPL-3.0-or-later"
@@ -16,6 +16,9 @@ crossterm = "0.28"
 portable-pty = "0.8"
 # Парсер ANSI-последовательностей (превращает "сырой" вывод в сетку символов)
 vt100 = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
 
 [[bin]]
 name = "CmdNest"

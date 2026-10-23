@@ -1,8 +1,10 @@
 use crossterm::event::{
     self, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+
 use ratatui::layout::{Rect, Size};
 
+use crate::config::{self, Config};
 use crate::layout::{find_neighbor, Layout, NavDir, SplitDir};
 use crate::pane::{key_event_to_bytes, Pane};
 
@@ -13,10 +15,11 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(area: Rect) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(area: Rect, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let pane = Pane::new(
             area.height.saturating_sub(2),
             area.width.saturating_sub(2),
+            config,
         )?;
         Ok(Tab {
             layout: Layout::Leaf(0),
@@ -39,10 +42,15 @@ impl Tab {
         }
     }
 
-    pub fn split(&mut self, dir: SplitDir, area: Rect) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn split(
+        &mut self,
+        dir: SplitDir,
+        area: Rect,
+        config: &Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let new_idx = self.panes.len();
         if self.layout.split_at(self.focused, new_idx, dir) {
-            let new_pane = Pane::new(1, 1)?;
+            let new_pane = Pane::new(1, 1, config)?;
             self.panes.push(new_pane);
             self.focused = new_idx;
             self.resize_all(area);
@@ -67,18 +75,20 @@ pub struct App {
     pub active: usize,
     pub prefix_active: bool,
     pub main_area: Rect,
+    pub config: Config,
 }
 
 impl App {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
         let (cols, rows) = crossterm::terminal::size()?;
         let main_area = Rect::new(0, 0, cols, rows.saturating_sub(1));
-        let tab = Tab::new(main_area)?;
+        let tab = Tab::new(main_area, &config)?;
         Ok(App {
             tabs: vec![tab],
             active: 0,
             prefix_active: false,
             main_area,
+            config,
         })
     }
 
@@ -99,47 +109,62 @@ impl App {
 
         if self.prefix_active {
             self.prefix_active = false;
+
+            let k = self.config.keys.clone();
+            let area = self.main_area;
+
+            // ---- вкладки ----
+            if config::char_matches(&key, &k.new_tab) {
+                let new_tab = Tab::new(area, &self.config)?;
+                self.tabs.push(new_tab);
+                self.active = self.tabs.len() - 1;
+                return Ok(());
+            }
+            if config::char_matches(&key, &k.next_tab) {
+                if self.active < self.tabs.len() - 1 {
+                    self.active += 1;
+                }
+                return Ok(());
+            }
+            if config::char_matches(&key, &k.prev_tab) {
+                if self.active > 0 {
+                    self.active -= 1;
+                }
+                return Ok(());
+            }
+            if config::char_matches(&key, &k.close_tab) {
+                if self.tabs.len() > 1 {
+                    self.tabs.remove(self.active);
+                    if self.active >= self.tabs.len() {
+                        self.active = self.tabs.len() - 1;
+                    }
+                }
+                return Ok(());
+            }
+
+
+            // ---- сплиты ----
+            if config::char_matches(&key, &k.split_vertical) {
+                let cfg = self.config.clone();
+                self.current_tab_mut().split(SplitDir::Vertical, area, &cfg)?;
+                return Ok(());
+            }
+            if config::char_matches(&key, &k.split_horizontal) {
+                let cfg = self.config.clone();
+                self.current_tab_mut().split(SplitDir::Horizontal, area, &cfg)?;
+                return Ok(());
+            }
+
+
+            if config::char_matches(&key, &k.close_pane) {
+                self.current_tab_mut().close_focused(area);
+                return Ok(());
+            }
+
+
+
+            // ---- фокус ----
             match key.code {
-                // ---- вкладки ----
-                KeyCode::Char('c') => {
-                    let new_tab = Tab::new(self.main_area)?;
-                    self.tabs.push(new_tab);
-                    self.active = self.tabs.len() - 1;
-                }
-                KeyCode::Char('n') => {
-                    if self.active < self.tabs.len() - 1 {
-                        self.active += 1;
-                    }
-                }
-                KeyCode::Char('p') => {
-                    if self.active > 0 {
-                        self.active -= 1;
-                    }
-                }
-                KeyCode::Char('&') => {
-                    if self.tabs.len() > 1 {
-                        self.tabs.remove(self.active);
-                        if self.active >= self.tabs.len() {
-                            self.active = self.tabs.len() - 1;
-                        }
-                    }
-                }
-                // ---- сплиты ----
-
-KeyCode::Char('%') | KeyCode::Char('|') => {
-    let area = self.main_area;
-    self.current_tab_mut().split(SplitDir::Vertical, area)?;
-}
-KeyCode::Char('"') | KeyCode::Char('-') => {
-    let area = self.main_area;
-    self.current_tab_mut().split(SplitDir::Horizontal, area)?;
-}
-KeyCode::Char('x') => {
-    let area = self.main_area;
-    self.current_tab_mut().close_focused(area);
-}
-
-                // ---- фокус ----
                 KeyCode::Left => self.focus_dir(NavDir::Left),
                 KeyCode::Right => self.focus_dir(NavDir::Right),
                 KeyCode::Up => self.focus_dir(NavDir::Up),
@@ -147,11 +172,17 @@ KeyCode::Char('x') => {
                 KeyCode::Esc => {}
                 _ => {}
             }
-        } else if key.code == KeyCode::Char('b')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+            return Ok(());
+        }
+
+        // Префикс?
+        if config::matches_key(&key, &self.config.general.prefix) {
             self.prefix_active = true;
-        } else if key.modifiers.contains(KeyModifiers::ALT) {
+            return Ok(());
+        }
+
+        // Alt+стрелки — прямое переключение
+        if key.modifiers.contains(KeyModifiers::ALT) {
             let dir = match key.code {
                 KeyCode::Left => Some(NavDir::Left),
                 KeyCode::Right => Some(NavDir::Right),
@@ -162,13 +193,15 @@ KeyCode::Char('x') => {
             if let Some(d) = dir {
                 self.focus_dir(d);
             }
-        } else {
-            let bytes = key_event_to_bytes(key);
-            if !bytes.is_empty() {
-                let focused = self.current_tab().focused;
-                if focused < self.current_tab().panes.len() {
-                    self.current_tab_mut().panes[focused].write_bytes(&bytes);
-                }
+            return Ok(());
+        }
+
+        // Всё остальное — в PTY
+        let bytes = key_event_to_bytes(key);
+        if !bytes.is_empty() {
+            let focused = self.current_tab().focused;
+            if focused < self.current_tab().panes.len() {
+                self.current_tab_mut().panes[focused].write_bytes(&bytes);
             }
         }
         Ok(())
@@ -182,39 +215,35 @@ KeyCode::Char('x') => {
         }
     }
 
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // 1. Клик левой кнопкой — найти панель под курсором и переключить фокус
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let area = self.main_area;
+            let rects = self.current_tab().pane_rects(area);
 
-pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-    // 1. Клик левой кнопкой — найти панель под курсором и переключить на неё фокус
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        let area = self.main_area;
-        let rects = self.current_tab().pane_rects(area);
-
-        // Перебираем все панели: если точка клика попадает в прямоугольник — фокус туда
-        for (idx, rect) in &rects {
-            let inside_x = mouse.column >= rect.x && mouse.column < rect.x + rect.width;
-            let inside_y = mouse.row >= rect.y && mouse.row < rect.y + rect.height;
-            if inside_x && inside_y {
-                self.current_tab_mut().focused = *idx;
-                return;
+            for (idx, rect) in &rects {
+                let inside_x = mouse.column >= rect.x && mouse.column < rect.x + rect.width;
+                let inside_y = mouse.row >= rect.y && mouse.row < rect.y + rect.height;
+                if inside_x && inside_y {
+                    self.current_tab_mut().focused = *idx;
+                    return;
+                }
             }
+            return;
         }
-        // Клик мимо панелей (статус-бар, за пределами) — ничего не делаем
-        return;
-    }
 
-    // 2. Скролл — применяется к активной (focused) панели
-    let focused = self.current_tab().focused;
-    let tab = self.current_tab_mut();
-    if focused >= tab.panes.len() {
-        return;
+        // 2. Скролл — к активной панели
+        let focused = self.current_tab().focused;
+        let tab = self.current_tab_mut();
+        if focused >= tab.panes.len() {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => tab.panes[focused].scroll_up(3),
+            MouseEventKind::ScrollDown => tab.panes[focused].scroll_down(3),
+            _ => {}
+        }
     }
-    match mouse.kind {
-        MouseEventKind::ScrollUp => tab.panes[focused].scroll_up(3),
-        MouseEventKind::ScrollDown => tab.panes[focused].scroll_down(3),
-        _ => {}
-    }
-}
-
 
     pub fn handle_resize(&mut self, cols: u16, rows: u16) {
         self.main_area = Rect::new(0, 0, cols, rows.saturating_sub(1));

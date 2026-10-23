@@ -7,6 +7,7 @@ use ratatui::{
 };
 use vt100::Color as VtColor;
 
+use crate::config::parse_color;
 use crate::app::App;
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -22,11 +23,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         let pane = &tab.panes[*idx];
         let is_focused = *idx == tab.focused;
+        
         let border_color = if is_focused {
-            Color::Cyan
+            parse_color(&app.config.colors.border_focused)
         } else {
-            Color::DarkGray
+            parse_color(&app.config.colors.border_unfocused)
         };
+
 
         if pane.scroll_offset > 0 {
             if let Ok(mut p) = pane.parser.lock() {
@@ -89,33 +92,41 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     let status_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+    
     let (status_text, status_bg) = if app.prefix_active {
         (
-            " PREFIX: c=new tab  n/p=next/prev  &=close tab  %=V  \"=H  x=pane  Esc=cancel "
-                .to_string(),
-            Color::Yellow,
+            " PREFIX active — Esc to cancel ".to_string(),
+            Color::Yellow, // во время префикса всегда жёлтый, чтобы было заметно
         )
     } else {
+        let prefix = &app.config.general.prefix;
         (
             format!(
-                " Tab {}/{} | Pane {}/{} | Wheel: scroll | Alt+Arrows: focus | Ctrl+B: prefix ",
+                " Tab {}/{} | Pane {}/{} | Wheel: scroll | Alt+Arrows: focus | {}: prefix ",
                 app.active + 1,
                 app.tabs.len(),
                 tab.focused + 1,
                 tab.panes.len(),
+                prefix,
             ),
-            Color::Cyan,
+            parse_color(&app.config.colors.status_bg),
         )
     };
+
+
     let status = Paragraph::new(Line::from(vec![Span::styled(
         status_text,
         Style::default()
-            .fg(Color::Black)
+            .fg(parse_color(&app.config.colors.status_fg))
             .bg(status_bg)
             .add_modifier(Modifier::BOLD),
     )]));
+
+
     f.render_widget(status, status_area);
 }
+
+
 
 fn build_line(screen: &vt100::Screen, row: u16, width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();

@@ -7,6 +7,8 @@ use std::{
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::layout::Rect;
+use crate::config::Config;
+
 
 pub struct Pane {
     pub parser: Arc<Mutex<vt100::Parser>>,
@@ -17,7 +19,7 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn new(rows: u16, cols: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        pub fn new(rows: u16, cols: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: rows.max(1),
@@ -26,7 +28,12 @@ impl Pane {
             pixel_height: 0,
         })?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                let shell = config
+            .general
+            .shell
+            .clone()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "/bin/bash".to_string());
         let mut cmd = CommandBuilder::new(&shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -34,7 +41,7 @@ impl Pane {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-        let parser = vt100::Parser::new(rows.max(1), cols.max(1), 1000);
+                let parser = vt100::Parser::new(rows.max(1), cols.max(1), config.general.scrollback_lines);
         let parser = Arc::new(Mutex::new(parser));
 
         let mut reader = pair.master.try_clone_reader()?;

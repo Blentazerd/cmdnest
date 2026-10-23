@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod layout;
 mod pane;
 mod ui;
@@ -15,6 +16,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Загружаем конфиг ПЕРЕД всеми остальными действиями
+    let config = config::Config::load();
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -23,7 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new()?;
+    // 2. Передаём ЕГО в App::new
+    let mut app = App::new(config)?;
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
