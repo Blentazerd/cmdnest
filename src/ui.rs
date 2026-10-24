@@ -93,25 +93,38 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let status_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
     
+
     let (status_text, status_bg) = if app.prefix_active {
         (
-            " PREFIX active — Esc to cancel ".to_string(),
-            Color::Yellow, // во время префикса всегда жёлтый, чтобы было заметно
+            format!(
+                " PREFIX: {} new-tab {} next {} prev {} splitV {} splitH {} close {} mouse Esc cancel ",
+                app.config.keys.new_tab,
+                app.config.keys.next_tab,
+                app.config.keys.prev_tab,
+                app.config.keys.split_vertical,
+                app.config.keys.split_horizontal,
+                app.config.keys.close_pane,
+                app.config.keys.toggle_mouse,
+            ),
+            Color::Yellow,
         )
     } else {
         let prefix = &app.config.general.prefix;
         (
             format!(
-                " Tab {}/{} | Pane {}/{} | Wheel: scroll | Alt+Arrows: focus | {}: prefix ",
+                " Tab {}/{} | Pane {}/{} | Mouse:{} | {}: prefix ",
                 app.active + 1,
                 app.tabs.len(),
                 tab.focused + 1,
                 tab.panes.len(),
+                if app.mouse_enabled { "ON" } else { "OFF" },
                 prefix,
             ),
             parse_color(&app.config.colors.status_bg),
         )
     };
+
+
 
 
     let status = Paragraph::new(Line::from(vec![Span::styled(

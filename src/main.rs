@@ -28,10 +28,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     terminal.clear()?;
 
     // 2. Передаём ЕГО в App::new
+
+
     let mut app = App::new(config)?;
 
+    // Первый кадр рисуем всегда
+    let mut needs_draw = true;
+
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        // Рисуем только если: (а) было событие, (б) пришли новые данные из PTY
+        if needs_draw || app.take_dirty() {
+            terminal.draw(|f| ui::draw(f, &app))?;
+            needs_draw = false;
+        }
 
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
@@ -42,13 +51,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                     app.handle_key(key, terminal.size()?)?;
+                    needs_draw = true;
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(cols, rows) => app.handle_resize(cols, rows),
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                    needs_draw = true;
+                }
+                Event::Resize(cols, rows) => {
+                    app.handle_resize(cols, rows);
+                    needs_draw = true;
+                }
                 _ => {}
             }
         }
     }
+
+
 
     disable_raw_mode()?;
     execute!(

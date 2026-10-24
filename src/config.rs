@@ -44,6 +44,8 @@ pub struct Keys {
     pub close_tab: String,
     /// Закрыть панель.
     pub close_pane: String,
+    /// Переключить захват мыши (вкл/выкл).
+    pub toggle_mouse: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -87,6 +89,7 @@ impl Default for Keys {
             prev_tab: "p".to_string(),
             close_tab: "&".to_string(),
             close_pane: "x".to_string(),
+            toggle_mouse: "m".to_string(),
         }
     }
 }
@@ -247,6 +250,8 @@ next_tab = "n"
 prev_tab = "p"
 close_tab = "&"
 close_pane = "x"
+toggle_mouse = "m"
+
 
 [colors]
 # Цвета можно задавать именами: black, red, green, yellow, blue,

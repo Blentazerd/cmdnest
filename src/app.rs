@@ -1,6 +1,8 @@
 use crossterm::event::{
-    self, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
+use crossterm::execute;
 
 use ratatui::layout::{Rect, Size};
 
@@ -76,6 +78,7 @@ pub struct App {
     pub prefix_active: bool,
     pub main_area: Rect,
     pub config: Config,
+    pub mouse_enabled: bool,
 }
 
 impl App {
@@ -89,7 +92,21 @@ impl App {
             prefix_active: false,
             main_area,
             config,
+            mouse_enabled: true,
         })
+    }
+
+    /// Проверить все панели всех вкладок: есть ли где-то новые данные.
+    pub fn take_dirty(&self) -> bool {
+        let mut any = false;
+        for tab in &self.tabs {
+            for pane in &tab.panes {
+                if pane.take_dirty() {
+                    any = true;
+                }
+            }
+        }
+        any
     }
 
     pub fn current_tab(&self) -> &Tab {
@@ -162,6 +179,17 @@ impl App {
             }
 
 
+                 // ---- переключение мыши ----
+            if config::char_matches(&key, &k.toggle_mouse) {
+                self.mouse_enabled = !self.mouse_enabled;
+                if self.mouse_enabled {
+                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                } else {
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                }
+                return Ok(());
+            }
+
 
             // ---- фокус ----
             match key.code {
@@ -216,6 +244,11 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Если мышь отключена — игнорируем все события
+if !self.mouse_enabled {
+            return;
+        }
+
         // 1. Клик левой кнопкой — найти панель под курсором и переключить фокус
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let area = self.main_area;
