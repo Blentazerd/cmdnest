@@ -14,18 +14,40 @@ pub enum NavDir {
     Down,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ResizeDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Clone)]
 pub enum Layout {
     Leaf(usize),
-    Split(SplitDir, Box<Layout>, Box<Layout>),
+    Split {
+        dir: SplitDir,
+        a: Box<Layout>,
+        b: Box<Layout>,
+        ratio: f32,
+    },
 }
 
 impl Layout {
+    pub fn new_split(dir: SplitDir, a: Layout, b: Layout) -> Self {
+        Layout::Split {
+            dir,
+            a: Box::new(a),
+            b: Box::new(b),
+            ratio: 0.5,
+        }
+    }
+
     pub fn compute(&self, area: Rect, out: &mut Vec<(usize, Rect)>) {
         match self {
             Layout::Leaf(idx) => out.push((*idx, area)),
-            Layout::Split(dir, a, b) => {
-                let (ra, rb) = split_area(area, *dir);
+            Layout::Split { dir, a, b, ratio } => {
+                let (ra, rb) = split_area_ratio(area, *dir, *ratio);
                 a.compute(ra, out);
                 b.compute(rb, out);
             }
@@ -36,14 +58,10 @@ impl Layout {
         match self {
             Layout::Leaf(i) if *i == target => {
                 let old = *i;
-                *self = Layout::Split(
-                    dir,
-                    Box::new(Layout::Leaf(old)),
-                    Box::new(Layout::Leaf(new_idx)),
-                );
+                *self = Layout::new_split(dir, Layout::Leaf(old), Layout::Leaf(new_idx));
                 true
             }
-            Layout::Split(_, a, b) => {
+            Layout::Split { a, b, .. } => {
                 a.split_at(target, new_idx, dir) || b.split_at(target, new_idx, dir)
             }
             _ => false,
@@ -53,7 +71,7 @@ impl Layout {
     pub fn close_at(&mut self, target: usize) -> bool {
         match self {
             Layout::Leaf(_) => false,
-            Layout::Split(_, a, b) => {
+            Layout::Split { a, b, .. } => {
                 if let Layout::Leaf(i) = **a {
                     if i == target {
                         let sibling = std::mem::replace(b.as_mut(), Layout::Leaf(0));
@@ -80,26 +98,85 @@ impl Layout {
                     *i -= 1;
                 }
             }
-            Layout::Split(_, a, b) => {
+            Layout::Split { a, b, .. } => {
                 a.renumber(removed);
                 b.renumber(removed);
             }
         }
     }
+
+    /// Меняет ratio ближайшего сплита (в направлении `dir`), содержащего `target`.
+    pub fn adjust_ratio(&mut self, target: usize, dir: ResizeDir, delta: f32) -> bool {
+        match self {
+            Layout::Leaf(_) => false,
+            Layout::Split {
+                dir: split_dir,
+                a,
+                b,
+                ratio,
+            } => {
+                let target_in_a = a.contains(target);
+                let target_in_b = b.contains(target);
+
+                if !target_in_a && !target_in_b {
+                    return false;
+                }
+
+                let matches_dir = match (split_dir, dir) {
+                    (SplitDir::Vertical, ResizeDir::Left | ResizeDir::Right) => true,
+                    (SplitDir::Horizontal, ResizeDir::Up | ResizeDir::Down) => true,
+                    _ => false,
+                };
+
+                if matches_dir && (a.is_leaf(target) || b.is_leaf(target)) {
+                    let sign = match (dir, target_in_a) {
+                        (ResizeDir::Right, true) | (ResizeDir::Left, false) => 1.0,
+                        (ResizeDir::Left, true) | (ResizeDir::Right, false) => -1.0,
+                        (ResizeDir::Down, true) | (ResizeDir::Up, false) => 1.0,
+                        (ResizeDir::Up, true) | (ResizeDir::Down, false) => -1.0,
+                    };
+                    *ratio = (*ratio + sign * delta).clamp(0.1, 0.9);
+                    return true;
+                }
+
+                if target_in_a {
+                    a.adjust_ratio(target, dir, delta)
+                } else {
+                    b.adjust_ratio(target, dir, delta)
+                }
+            }
+        }
+    }
+
+    fn contains(&self, target: usize) -> bool {
+        match self {
+            Layout::Leaf(i) => *i == target,
+            Layout::Split { a, b, .. } => a.contains(target) || b.contains(target),
+        }
+    }
+
+    fn is_leaf(&self, target: usize) -> bool {
+        matches!(self, Layout::Leaf(i) if *i == target)
+    }
 }
 
-fn split_area(area: Rect, dir: SplitDir) -> (Rect, Rect) {
+fn split_area_ratio(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect) {
+    let ratio = ratio.clamp(0.1, 0.9);
     match dir {
         SplitDir::Vertical => {
-            let half = area.width / 2;
-            let a = Rect::new(area.x, area.y, half, area.height);
-            let b = Rect::new(area.x + half, area.y, area.width - half, area.height);
+            let w1 = ((area.width as f32 * ratio) as u16)
+                .max(1)
+                .min(area.width.saturating_sub(1));
+            let a = Rect::new(area.x, area.y, w1, area.height);
+            let b = Rect::new(area.x + w1, area.y, area.width - w1, area.height);
             (a, b)
         }
         SplitDir::Horizontal => {
-            let half = area.height / 2;
-            let a = Rect::new(area.x, area.y, area.width, half);
-            let b = Rect::new(area.x, area.y + half, area.width, area.height - half);
+            let h1 = ((area.height as f32 * ratio) as u16)
+                .max(1)
+                .min(area.height.saturating_sub(1));
+            let a = Rect::new(area.x, area.y, area.width, h1);
+            let b = Rect::new(area.x, area.y + h1, area.width, area.height - h1);
             (a, b)
         }
     }

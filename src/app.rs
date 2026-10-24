@@ -1,13 +1,13 @@
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 
 use ratatui::layout::{Rect, Size};
 
 use crate::config::{self, Config};
-use crate::layout::{find_neighbor, Layout, NavDir, SplitDir};
+use crate::layout::{find_neighbor, Layout, NavDir, ResizeDir, SplitDir};
 use crate::pane::{key_event_to_bytes, Pane};
 
 pub struct Tab {
@@ -68,6 +68,16 @@ impl Tab {
                 self.focused = self.panes.len() - 1;
             }
             self.resize_all(area);
+        }
+    }
+
+    pub fn resize_focused(&mut self, dir: ResizeDir, area: Rect) -> bool {
+        let delta = 0.03;
+        if self.layout.adjust_ratio(self.focused, dir, delta) {
+            self.resize_all(area);
+            true
+        } else {
+            false
         }
     }
 }
@@ -159,27 +169,25 @@ impl App {
                 return Ok(());
             }
 
-
             // ---- сплиты ----
             if config::char_matches(&key, &k.split_vertical) {
                 let cfg = self.config.clone();
-                self.current_tab_mut().split(SplitDir::Vertical, area, &cfg)?;
+                self.current_tab_mut()
+                    .split(SplitDir::Vertical, area, &cfg)?;
                 return Ok(());
             }
             if config::char_matches(&key, &k.split_horizontal) {
                 let cfg = self.config.clone();
-                self.current_tab_mut().split(SplitDir::Horizontal, area, &cfg)?;
+                self.current_tab_mut()
+                    .split(SplitDir::Horizontal, area, &cfg)?;
                 return Ok(());
             }
-
-
             if config::char_matches(&key, &k.close_pane) {
                 self.current_tab_mut().close_focused(area);
                 return Ok(());
             }
 
-
-                 // ---- переключение мыши ----
+            // ---- переключение мыши ----
             if config::char_matches(&key, &k.toggle_mouse) {
                 self.mouse_enabled = !self.mouse_enabled;
                 if self.mouse_enabled {
@@ -190,15 +198,32 @@ impl App {
                 return Ok(());
             }
 
-
-            // ---- фокус ----
-            match key.code {
-                KeyCode::Left => self.focus_dir(NavDir::Left),
-                KeyCode::Right => self.focus_dir(NavDir::Right),
-                KeyCode::Up => self.focus_dir(NavDir::Up),
-                KeyCode::Down => self.focus_dir(NavDir::Down),
-                KeyCode::Esc => {}
-                _ => {}
+            // ---- resize / фокус ----
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                match key.code {
+                    KeyCode::Left => {
+                        self.resize_active(ResizeDir::Left);
+                    }
+                    KeyCode::Right => {
+                        self.resize_active(ResizeDir::Right);
+                    }
+                    KeyCode::Up => {
+                        self.resize_active(ResizeDir::Up);
+                    }
+                    KeyCode::Down => {
+                        self.resize_active(ResizeDir::Down);
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Left => self.focus_dir(NavDir::Left),
+                    KeyCode::Right => self.focus_dir(NavDir::Right),
+                    KeyCode::Up => self.focus_dir(NavDir::Up),
+                    KeyCode::Down => self.focus_dir(NavDir::Down),
+                    KeyCode::Esc => {}
+                    _ => {}
+                }
             }
             return Ok(());
         }
@@ -209,7 +234,7 @@ impl App {
             return Ok(());
         }
 
-        // Alt+стрелки — прямое переключение
+        // Alt+стрелки — прямое переключение фокуса (без префикса)
         if key.modifiers.contains(KeyModifiers::ALT) {
             let dir = match key.code {
                 KeyCode::Left => Some(NavDir::Left),
@@ -243,9 +268,14 @@ impl App {
         }
     }
 
+    pub fn resize_active(&mut self, dir: ResizeDir) -> bool {
+        let area = self.main_area;
+        self.current_tab_mut().resize_focused(dir, area)
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         // Если мышь отключена — игнорируем все события
-if !self.mouse_enabled {
+        if !self.mouse_enabled {
             return;
         }
 
