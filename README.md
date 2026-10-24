@@ -155,13 +155,3 @@ GNU AGPL-3.0-or-later — см. LICENSE.
 
 Статус
 Версия v1.0.0 — первая стабильная. В планах: copy mode, detach/attach.
-
-text
-
-Сохрани, закоммить:
-
-```bash
-cd ~/cmdnest
-git add README.md
-git commit -m "docs: README v1.0.0 + ссылка на скачивание бинарника"
-git push
