@@ -1,14 +1,17 @@
 use std::{
     io::{Read, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::layout::Rect;
-use crate::config::Config;
 
+use crate::config::Config;
 
 pub struct Pane {
     pub parser: Arc<Mutex<vt100::Parser>>,
@@ -16,10 +19,11 @@ pub struct Pane {
     pub master: Box<dyn MasterPty + Send>,
     pub child: Box<dyn Child + Send + Sync>,
     pub scroll_offset: usize,
+    pub dirty: Arc<AtomicBool>,
 }
 
 impl Pane {
-        pub fn new(rows: u16, cols: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(rows: u16, cols: u16, config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: rows.max(1),
@@ -28,7 +32,7 @@ impl Pane {
             pixel_height: 0,
         })?;
 
-                let shell = config
+        let shell = config
             .general
             .shell
             .clone()
@@ -41,8 +45,11 @@ impl Pane {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
-                let parser = vt100::Parser::new(rows.max(1), cols.max(1), config.general.scrollback_lines);
+        let parser = vt100::Parser::new(rows.max(1), cols.max(1), config.general.scrollback_lines);
         let parser = Arc::new(Mutex::new(parser));
+
+        let dirty = Arc::new(AtomicBool::new(true));
+        let dirty_clone = Arc::clone(&dirty);
 
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
@@ -57,6 +64,7 @@ impl Pane {
                         if let Ok(mut p) = parser_clone.lock() {
                             p.process(&buf[..n]);
                         }
+                        dirty_clone.store(true, Ordering::Relaxed);
                     }
                     Err(_) => break,
                 }
@@ -69,6 +77,7 @@ impl Pane {
             master: pair.master,
             child,
             scroll_offset: 0,
+            dirty,
         })
     }
 
@@ -110,6 +119,11 @@ impl Pane {
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    /// Забрать флаг «есть новые данные». Возвращает true один раз — потом сбрасывается.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
     }
 }
 
