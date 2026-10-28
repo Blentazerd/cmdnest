@@ -2,9 +2,13 @@
 
 mod client;
 mod config;
+mod layout;
 mod pane;
 mod protocol;
 mod server;
+
+
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -22,17 +26,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             Ok(())
         }
+
+
+       
         "attach" | "a" | "" => {
             if std::os::unix::net::UnixStream::connect(protocol::socket_path()).is_err() {
-                // Запустить сервер
                 let exe = std::env::current_exe()?;
-                std::process::Command::new(exe)
-                    .arg("server")
+                // pre_exec: отвязаться от терминала ДО exec, чтобы сервер
+                // не получал SIGHUP при закрытии клиента.
+                use std::os::unix::process::CommandExt;
+
+
+
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("server")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()?;
-                // Ждём готовности сокета до 3 секунд
+                    .stderr(std::process::Stdio::null());
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+                let child = cmd.spawn()?;
+
+
+
+                // Не ждать ребёнка — он должен жить сам по себе
+                std::mem::forget(child);
                 for _ in 0..60 {
                     if std::os::unix::net::UnixStream::connect(protocol::socket_path()).is_ok() {
                         break;
@@ -42,6 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             client::run()
         }
+
+
+
         _ => {
             eprintln!("Usage: cmdnest [server|attach|kill]");
             Ok(())

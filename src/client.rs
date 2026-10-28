@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{
@@ -8,71 +9,138 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Position,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
-    Terminal,
+    widgets::{Block, Borders, Paragraph},
+    Frame, Terminal,
 };
 use vt100::Color as VtColor;
 
 use crate::protocol::*;
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[DEBUG] client::run starting");
+struct PaneParser {
+    parser: vt100::Parser,
+    history: Vec<u8>,
+}
 
+struct ClientState {
+    snap: Snapshot,
+    parsers: HashMap<u64, PaneParser>,
+}
+
+impl ClientState {
+    fn new(snap: Snapshot) -> Self {
+        let mut parsers = HashMap::new();
+        for tab in &snap.tabs {
+            for p in &tab.panes {
+                let rows = p.rect.h.saturating_sub(2).max(1);
+                let cols = p.rect.w.saturating_sub(2).max(1);
+                let mut parser = vt100::Parser::new(rows, cols, 5000);
+                parser.process(&p.history);
+                parsers.insert(
+                    p.id,
+                    PaneParser {
+                        parser,
+                        history: p.history.clone(),
+                    },
+                );
+            }
+        }
+        ClientState { snap, parsers }
+    }
+
+    fn apply(&mut self, msg: ServerMsg) {
+        match msg {
+            ServerMsg::Snapshot { snap } => {
+                let mut new_parsers = HashMap::new();
+                for tab in &snap.tabs {
+                    for p in &tab.panes {
+                        let rows = p.rect.h.saturating_sub(2).max(1);
+                        let cols = p.rect.w.saturating_sub(2).max(1);
+                        if let Some(old) = self.parsers.remove(&p.id) {
+                            if old.parser.screen().size() != (rows, cols) {
+                                let mut np = vt100::Parser::new(rows, cols, 5000);
+                                np.process(&old.history);
+                                new_parsers.insert(
+                                    p.id,
+                                    PaneParser {
+                                        parser: np,
+                                        history: old.history,
+                                    },
+                                );
+                            } else {
+                                new_parsers.insert(p.id, old);
+                            }
+                        } else {
+                            let mut np = vt100::Parser::new(rows, cols, 5000);
+                            np.process(&p.history);
+                            new_parsers.insert(
+                                p.id,
+                                PaneParser {
+                                    parser: np,
+                                    history: p.history.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                self.parsers = new_parsers;
+                self.snap = snap;
+            }
+            ServerMsg::PaneOutput { tab, pane, data } => {
+                if let Some(pp) = self.parsers.get_mut(&pane) {
+                    pp.parser.process(&data);
+                    pp.history.extend_from_slice(&data);
+                    if pp.history.len() > 5_000_000 {
+                        let ex = pp.history.len() - 5_000_000;
+                        pp.history.drain(0..ex);
+                    }
+                }
+                if let Some(t) = self.snap.tabs.iter_mut().find(|t| t.id == tab) {
+                    if let Some(p) = t.panes.iter_mut().find(|p| p.id == pane) {
+                        p.history.extend_from_slice(&data);
+                        if p.history.len() > 5_000_000 {
+                            let ex = p.history.len() - 5_000_000;
+                            p.history.drain(0..ex);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path())?;
-    eprintln!("[DEBUG] connected");
     let read_stream = stream.try_clone()?;
     let mut writer = stream;
     let reader = BufReader::new(read_stream);
-
     let mut lines = reader.lines();
-    let init: ServerMsg = match lines.next() {
-        Some(Ok(l)) => {
-            eprintln!("[DEBUG] got Init ({} bytes)", l.len());
-            serde_json::from_str(&l)?
-        }
-        Some(Err(e)) => return Err(format!("read error: {}", e).into()),
-        None => return Err("no init from server".into()),
+
+    let snap: Snapshot = match lines.next() {
+        Some(Ok(l)) => match serde_json::from_str::<ServerMsg>(&l)? {
+            ServerMsg::Snapshot { snap } => snap,
+            _ => return Err("expected snapshot".into()),
+        },
+        _ => return Err("no initial message".into()),
     };
 
-    let (initial_history, cols, rows) = match init {
-        ServerMsg::Init { history, cols, rows } => {
-            eprintln!("[DEBUG] Init {}x{}, hist {} bytes", cols, rows, history.len());
-            (history, cols, rows)
-        }
-        _ => return Err("expected Init".into()),
-    };
-
-    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((cols, rows));
-    eprintln!("[DEBUG] real terminal = {}x{}", term_cols, term_rows);
-
-    // Держим всю историю для re-processing при resize
-    let history = Arc::new(Mutex::new(initial_history.clone()));
-
-    // Парсер создаём сразу с реальным размером (иначе set_size очистит буфер)
-    let parser = vt100::Parser::new(term_rows.max(1), term_cols.max(1), 5000);
-    let parser = Arc::new(Mutex::new(parser));
-    if let Ok(mut p) = parser.lock() {
-        p.process(&initial_history);
-    }
-    eprintln!("[DEBUG] history processed");
-
+    let state = Arc::new(Mutex::new(ClientState::new(snap)));
     let dirty = Arc::new(AtomicBool::new(true));
 
-    // Reader thread
-    let parser_cl = Arc::clone(&parser);
+    let state_cl = Arc::clone(&state);
     let dirty_cl = Arc::clone(&dirty);
-    let history_cl = Arc::clone(&history);
     thread::spawn(move || {
-        eprintln!("[DEBUG] reader thread started");
         for line in lines {
             let line = match line {
                 Ok(l) => l,
@@ -82,79 +150,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            if let ServerMsg::PtyOutput { data } = msg {
-                if let Ok(mut h) = history_cl.lock() {
-                    h.extend_from_slice(&data);
-                    if h.len() > 5_000_000 {
-                        let excess = h.len() - 5_000_000;
-                        h.drain(0..excess);
-                    }
-                }
-                if let Ok(mut p) = parser_cl.lock() {
-                    p.process(&data);
-                }
-                dirty_cl.store(true, Ordering::Relaxed);
+            if let Ok(mut st) = state_cl.lock() {
+                st.apply(msg);
             }
+            dirty_cl.store(true, Ordering::Relaxed);
         }
-        eprintln!("[DEBUG] reader thread exit");
     });
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-    eprintln!("[DEBUG] terminal ready");
 
-    if term_cols != cols || term_rows != rows {
-        let msg = serde_json::to_string(&ClientMsg::Resize {
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = writeln!(
+        writer,
+        "{}",
+        serde_json::to_string(&ClientMsg::Resize {
             cols: term_cols,
-            rows: term_rows,
-        })?;
-        let _ = writeln!(writer, "{}", msg);
-    }
+            rows: term_rows
+        })?
+    );
 
-    let mut needs_draw = true;
-    let mut scroll_offset: usize = 0;
     let mut prefix_active = false;
+    let mut needs_draw = true;
 
     let result = loop {
         if needs_draw || dirty.swap(false, Ordering::Relaxed) {
-            let dr = terminal.draw(|f| {
-                let area = f.area();
-                if scroll_offset > 0 {
-                    if let Ok(mut p) = parser.lock() {
-                        p.set_scrollback(scroll_offset);
-                    }
-                }
-                let (vlines, cursor_pos, hide_cursor) = {
-                    let p = match parser.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    let screen = p.screen();
-                    let vlines: Vec<Line> = (0..area.height)
-                        .map(|row| build_line(screen, row, area.width))
-                        .collect();
-                    (vlines, screen.cursor_position(), screen.hide_cursor())
-                };
-                if scroll_offset > 0 {
-                    if let Ok(mut p) = parser.lock() {
-                        p.set_scrollback(0);
-                    }
-                }
-                f.render_widget(Paragraph::new(vlines), area);
-                if !hide_cursor
-                    && scroll_offset == 0
-                    && cursor_pos.0 < area.height
-                    && cursor_pos.1 < area.width
-                {
-                    f.set_cursor_position(Position::new(cursor_pos.1, cursor_pos.0));
-                }
-            });
+            let st = state.lock().unwrap();
+            let dr = terminal.draw(|f| render(f, &st, prefix_active));
+            drop(st);
             if let Err(e) = dr {
-                eprintln!("[DEBUG] EXIT: draw failed: {}", e);
+                eprintln!("draw failed: {}", e);
                 break Ok(());
             }
             needs_draw = false;
@@ -165,78 +194,227 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         match event::read() {
             Ok(Event::Key(key)) => {
+               
+
                 if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    eprintln!("[DEBUG] EXIT: Ctrl+Q");
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        serde_json::to_string(&ClientMsg::Detach).unwrap()
+                    );
                     break Ok(());
                 }
+
+
+
                 if prefix_active {
                     prefix_active = false;
-                    if key.code == KeyCode::Char('d') {
-                        eprintln!("[DEBUG] EXIT: detach");
-                        let _ = writeln!(
-                            writer,
-                            "{}",
-                            serde_json::to_string(&ClientMsg::Detach).unwrap()
-                        );
-                        break Ok(());
+                    let msg = match key.code {
+                        KeyCode::Char('d') => Some(ClientMsg::Detach),
+                        KeyCode::Char('c') => Some(ClientMsg::NewTab),
+                        KeyCode::Char('n') => Some(ClientMsg::NextTab),
+                        KeyCode::Char('p') => Some(ClientMsg::PrevTab),
+                        KeyCode::Char('&') => Some(ClientMsg::CloseTab),
+                        KeyCode::Char('%') | KeyCode::Char('|') => Some(ClientMsg::SplitPane {
+                            dir: SplitDirP::Vertical,
+                        }),
+                        KeyCode::Char('"') | KeyCode::Char('-') => Some(ClientMsg::SplitPane {
+                            dir: SplitDirP::Horizontal,
+                        }),
+                        KeyCode::Char('x') => Some(ClientMsg::ClosePane),
+                        KeyCode::Left => Some(ClientMsg::FocusPane {
+                            dir: NavDirP::Left,
+                        }),
+                        KeyCode::Right => Some(ClientMsg::FocusPane {
+                            dir: NavDirP::Right,
+                        }),
+                        KeyCode::Up => Some(ClientMsg::FocusPane { dir: NavDirP::Up }),
+                        KeyCode::Down => Some(ClientMsg::FocusPane {
+                            dir: NavDirP::Down,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(m) = msg {
+                        if matches!(m, ClientMsg::Detach) {
+                            let _ = writeln!(writer, "{}", serde_json::to_string(&m)?);
+                            break Ok(());
+                        }
+                        let _ = writeln!(writer, "{}", serde_json::to_string(&m)?);
                     }
+                    needs_draw = true;
                     continue;
                 }
-                if key.code == KeyCode::Char('b')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     prefix_active = true;
                     needs_draw = true;
                     continue;
                 }
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    let dir = match key.code {
+                        KeyCode::Left => Some(ResizeDirP::Left),
+                        KeyCode::Right => Some(ResizeDirP::Right),
+                        KeyCode::Up => Some(ResizeDirP::Up),
+                        KeyCode::Down => Some(ResizeDirP::Down),
+                        _ => None,
+                    };
+                    if let Some(d) = dir {
+                        let _ = writeln!(
+                            writer,
+                            "{}",
+                            serde_json::to_string(&ClientMsg::ResizePane { dir: d })?
+                        );
+                        continue;
+                    }
+                }
                 let bytes = crate::pane::key_event_to_bytes(key);
                 if !bytes.is_empty() {
-                    let msg = serde_json::to_string(&ClientMsg::Input { data: bytes }).unwrap();
-                    let _ = writeln!(writer, "{}", msg);
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        serde_json::to_string(&ClientMsg::Input { data: bytes })?
+                    );
                 }
             }
-            Ok(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::ScrollUp => {
-                    scroll_offset += 3;
-                    needs_draw = true;
+            Ok(Event::Mouse(m)) => {
+                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                    let st = state.lock().unwrap();
+                    let mut hit = None;
+                    if let Some(tab) = st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
+                        for p in &tab.panes {
+                            let r = p.rect;
+                            if m.column >= r.x
+                                && m.column < r.x + r.w
+                                && m.row >= r.y
+                                && m.row < r.y + r.h
+                            {
+                                hit = Some(p.id);
+                                break;
+                            }
+                        }
+                    }
+                    drop(st);
+                    if let Some(pid) = hit {
+                        let _ = writeln!(
+                            writer,
+                            "{}",
+                            serde_json::to_string(&ClientMsg::SetFocus { pane_id: pid })?
+                        );
+                    }
                 }
-                MouseEventKind::ScrollDown => {
-                    scroll_offset = scroll_offset.saturating_sub(3);
-                    needs_draw = true;
-                }
-                _ => {}
-            },
+            }
             Ok(Event::Resize(c, r)) => {
-                // Пересоздаём парсер с новым размером и переобрабатываем историю,
-                // иначе set_size очистит буфер и экран станет пустым.
-                let mut new_parser = vt100::Parser::new(r.max(1), c.max(1), 5000);
-                if let Ok(hist) = history.lock() {
-                    new_parser.process(&hist);
-                }
-                if let Ok(mut p) = parser.lock() {
-                    *p = new_parser;
-                }
-                let msg = serde_json::to_string(&ClientMsg::Resize { cols: c, rows: r }).unwrap();
-                let _ = writeln!(writer, "{}", msg);
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::to_string(&ClientMsg::Resize { cols: c, rows: r })?
+                );
                 needs_draw = true;
-                eprintln!("[DEBUG] resized to {}x{}", c, r);
             }
             _ => {}
         }
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
-    eprintln!("[DEBUG] client exiting");
     result
+}
+
+fn render(f: &mut Frame, st: &ClientState, prefix_active: bool) {
+    let area = f.area();
+    let tab = match st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
+        Some(t) => t,
+        None => return,
+    };
+
+    for pane in &tab.panes {
+        let r = pane.rect;
+        let rect = Rect::new(r.x, r.y, r.w, r.h);
+        let inner = Rect::new(
+            rect.x + 1,
+            rect.y + 1,
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(2),
+        );
+
+        if let Some(pp) = st.parsers.get(&pane.id) {
+            let screen = pp.parser.screen();
+            let lines: Vec<Line> = (0..inner.height)
+                .map(|row| build_line(screen, row, inner.width))
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+
+            if pane.id == tab.focused && !screen.hide_cursor() {
+                let (cr, cc) = screen.cursor_position();
+                if cr < inner.height && cc < inner.width {
+                    f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
+                }
+            }
+        }
+
+        let is_focused = pane.id == tab.focused;
+        let border = if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+            rect,
+        );
+    }
+
+    let status_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
+    let tab_idx = st
+        .snap
+        .tabs
+        .iter()
+        .position(|t| t.id == st.snap.active)
+        .unwrap_or(0);
+    let pane_idx = tab
+        .panes
+        .iter()
+        .position(|p| p.id == tab.focused)
+        .unwrap_or(0);
+    let (text, bg) = if prefix_active {
+        (
+            " PREFIX: c=new-tab n/p=next/prev %/\"=split x=close d=detach Esc ".to_string(),
+            Color::Yellow,
+        )
+    } else {
+        (
+            format!(
+                " Tab {}/{} | Pane {}/{} | C-b: prefix | Ctrl+Q: exit ",
+                tab_idx + 1,
+                st.snap.tabs.len(),
+                pane_idx + 1,
+                tab.panes.len()
+            ),
+            Color::Cyan,
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        status_area,
+    );
 }
 
 fn build_line(screen: &vt100::Screen, row: u16, width: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur_style: Option<Style> = None;
     let mut cur_text = String::new();
-
     for col in 0..width {
         let Some(cell) = screen.cell(row, col) else {
             continue;
