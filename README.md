@@ -33,9 +33,9 @@
 Скачайте последний релиз со страницы [Releases](https://github.com/Blentazerd/cmdnest/releases):
 
 ```bash
-wget https://github.com/Blentazerd/cmdnest/releases/latest/download/CmdNest-v1.0.0-linux-x86_64
-chmod +x CmdNest-v1.0.0-linux-x86_64
-./CmdNest-v1.0.0-linux-x86_64
+wget https://github.com/Blentazerd/cmdnest/releases/latest/download/CmdNest-v1.1.0-linux-x86_64
+chmod +x CmdNest-v1.1.0-linux-x86_64
+./CmdNest-v1.1.0-linux-x86_64
 Из исходников
 bash
 git clone https://github.com/Blentazerd/cmdnest.git
