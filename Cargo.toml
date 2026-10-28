@@ -1,6 +1,6 @@
 [package]
 name = "cmdnest"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Минималистичный и удобный терминальный мультиплексор"
 license = "AGPL-3.0-or-later"
@@ -21,6 +21,7 @@ toml = "0.8"
 dirs = "5"
 serde_json = "1"
 libc = "0.2"
+arboard = "3"
 
 [[bin]]
 name = "CmdNest"

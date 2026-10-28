@@ -36,6 +36,8 @@ struct PaneParser {
 struct ClientState {
     snap: Snapshot,
     parsers: HashMap<u64, PaneParser>,
+    paused_pane: Option<u64>,
+    paused_buffer: Vec<u8>,
 }
 
 impl ClientState {
@@ -56,7 +58,12 @@ impl ClientState {
                 );
             }
         }
-        ClientState { snap, parsers }
+        ClientState {
+            snap,
+            parsers,
+            paused_pane: None,
+            paused_buffer: Vec::new(),
+        }
     }
 
     fn apply(&mut self, msg: ServerMsg) {
@@ -98,6 +105,10 @@ impl ClientState {
                 self.snap = snap;
             }
             ServerMsg::PaneOutput { tab, pane, data } => {
+                if self.paused_pane == Some(pane) {
+                    self.paused_buffer.extend_from_slice(&data);
+                    return;
+                }
                 if let Some(pp) = self.parsers.get_mut(&pane) {
                     pp.parser.process(&data);
                     pp.history.extend_from_slice(&data);
@@ -116,6 +127,42 @@ impl ClientState {
                     }
                 }
             }
+        }
+    }
+
+    fn resume_pane(&mut self) {
+        if let Some(pid) = self.paused_pane.take() {
+            let buf = std::mem::take(&mut self.paused_buffer);
+            if let Some(pp) = self.parsers.get_mut(&pid) {
+                pp.parser.process(&buf);
+                pp.history.extend_from_slice(&buf);
+                if pp.history.len() > 5_000_000 {
+                    let ex = pp.history.len() - 5_000_000;
+                    pp.history.drain(0..ex);
+                }
+            }
+        }
+    }
+}
+
+struct CopyMode {
+    active: bool,
+    scroll: usize,
+    cursor_row: u16,
+    cursor_col: u16,
+    start: Option<(u16, u16)>,
+    pane_id: u64,
+}
+
+impl CopyMode {
+    fn new() -> Self {
+        CopyMode {
+            active: false,
+            scroll: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            start: None,
+            pane_id: 0,
         }
     }
 }
@@ -176,11 +223,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut prefix_active = false;
     let mut needs_draw = true;
+    let mut copy = CopyMode::new();
 
     let result = loop {
         if needs_draw || dirty.swap(false, Ordering::Relaxed) {
-            let st = state.lock().unwrap();
-            let dr = terminal.draw(|f| render(f, &st, prefix_active));
+            let mut st = state.lock().unwrap();
+            if copy.active {
+                if let Some(pp) = st.parsers.get_mut(&copy.pane_id) {
+                    pp.parser.set_scrollback(copy.scroll);
+                }
+            }
+            let dr = terminal.draw(|f| render(f, &st, prefix_active, &copy));
+            if copy.active {
+                if let Some(pp) = st.parsers.get_mut(&copy.pane_id) {
+                    pp.parser.set_scrollback(0);
+                }
+            }
             drop(st);
             if let Err(e) = dr {
                 eprintln!("draw failed: {}", e);
@@ -194,19 +252,127 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         match event::read() {
             Ok(Event::Key(key)) => {
-               
+                // ---- Copy mode ----
+                if copy.active {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            copy.active = false;
+                            if let Ok(mut st) = state.lock() {
+                                st.resume_pane();
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            copy.start = Some((copy.cursor_row, copy.cursor_col));
+                        }
 
+                        KeyCode::Enter => {
+                            if let Some((sr, sc)) = copy.start {
+                                let text = {
+                                    let mut st = state.lock().unwrap();
+                                    if let Some(pp) = st.parsers.get_mut(&copy.pane_id) {
+                                        pp.parser.set_scrollback(copy.scroll);
+                                        let s = extract_selection(
+                                            pp.parser.screen(),
+                                            (sr, sc),
+                                            (copy.cursor_row, copy.cursor_col),
+                                        );
+                                        pp.parser.set_scrollback(0);
+                                        s
+                                    } else {
+                                        String::new()
+                                    }
+                                };
+                                if !text.is_empty() {
+                                    let _ = copy_to_clipboard(&text);
+                                }
+                            }
+                            copy.active = false;
+                            if let Ok(mut st) = state.lock() {
+                                st.resume_pane();
+                            }
+                        }
+
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if copy.cursor_row > 0 {
+                                copy.cursor_row -= 1;
+                            } else if copy.scroll > 0 {
+                                // прокрутить viewport вверх
+                                copy.scroll += 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let max_row = {
+                                let st = state.lock().unwrap();
+                                let pp = st.parsers.get(&copy.pane_id);
+                                if let Some(p) = pp {
+                                    p.parser.screen().size().0.saturating_sub(1)
+                                } else {
+                                    23
+                                }
+                            };
+                            if copy.cursor_row < max_row {
+                                copy.cursor_row += 1;
+                            } else if copy.scroll > 0 {
+                                copy.scroll -= 1;
+                            }
+                        }
+                        KeyCode::Left | KeyCode::Char('h') => {
+                            if copy.cursor_col > 0 {
+                                copy.cursor_col -= 1;
+                            }
+                        }
+                        KeyCode::Right | KeyCode::Char('l') => {
+                            let max_col = {
+                                let st = state.lock().unwrap();
+                                let pp = st.parsers.get(&copy.pane_id);
+                                if let Some(p) = pp {
+                                    p.parser.screen().size().1.saturating_sub(1)
+                                } else {
+                                    79
+                                }
+                            };
+                            if copy.cursor_col < max_col {
+                                copy.cursor_col += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            copy.scroll += 20;
+                        }
+                        KeyCode::PageDown => {
+                            copy.scroll = copy.scroll.saturating_sub(20);
+                        }
+                        KeyCode::Home => {
+                            copy.cursor_col = 0;
+                        }
+                        KeyCode::End => {
+                            let max_col = {
+                                let st = state.lock().unwrap();
+                                let pp = st.parsers.get(&copy.pane_id);
+                                if let Some(p) = pp {
+                                    p.parser.screen().size().1.saturating_sub(1)
+                                } else {
+                                    79
+                                }
+                            };
+                            copy.cursor_col = max_col;
+                        }
+                        _ => {}
+                    }
+                    needs_draw = true;
+                    continue;
+                }
+
+                // ---- Выход ----
                 if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     let _ = writeln!(
                         writer,
                         "{}",
-                        serde_json::to_string(&ClientMsg::Detach).unwrap()
+                        serde_json::to_string(&ClientMsg::Detach)?
                     );
                     break Ok(());
                 }
 
-
-
+                // ---- Prefix ----
                 if prefix_active {
                     prefix_active = false;
                     let msg = match key.code {
@@ -222,16 +388,37 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             dir: SplitDirP::Horizontal,
                         }),
                         KeyCode::Char('x') => Some(ClientMsg::ClosePane),
-                        KeyCode::Left => Some(ClientMsg::FocusPane {
-                            dir: NavDirP::Left,
-                        }),
-                        KeyCode::Right => Some(ClientMsg::FocusPane {
-                            dir: NavDirP::Right,
-                        }),
+                        KeyCode::Char('[') => {
+                            // вход в copy mode
+                            let st = state.lock().unwrap();
+                            if let Some(tab) = st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
+                                let pid = tab.focused;
+                                let (scroll, h, w) = st
+                                    .parsers
+                                    .get(&pid)
+                                    .map(|p| {
+                                        let (hh, ww) = p.parser.screen().size();
+                                        (p.parser.screen().scrollback(), hh, ww)
+                                    })
+                                    .unwrap_or((0, 24, 80));
+                                drop(st);
+                                copy.active = true;
+                                copy.pane_id = pid;
+                                copy.scroll = scroll;
+                                copy.cursor_row = 0;
+                                copy.cursor_col = 0;
+                                copy.start = None;
+                                let _ = (h, w);
+                                let mut st2 = state.lock().unwrap();
+                                st2.paused_pane = Some(pid);
+                                st2.paused_buffer.clear();
+                            }
+                            None
+                        }
+                        KeyCode::Left => Some(ClientMsg::FocusPane { dir: NavDirP::Left }),
+                        KeyCode::Right => Some(ClientMsg::FocusPane { dir: NavDirP::Right }),
                         KeyCode::Up => Some(ClientMsg::FocusPane { dir: NavDirP::Up }),
-                        KeyCode::Down => Some(ClientMsg::FocusPane {
-                            dir: NavDirP::Down,
-                        }),
+                        KeyCode::Down => Some(ClientMsg::FocusPane { dir: NavDirP::Down }),
                         _ => None,
                     };
                     if let Some(m) = msg {
@@ -244,11 +431,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     needs_draw = true;
                     continue;
                 }
+
                 if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     prefix_active = true;
                     needs_draw = true;
                     continue;
                 }
+
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     let dir = match key.code {
                         KeyCode::Left => Some(ResizeDirP::Left),
@@ -276,6 +465,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(Event::Mouse(m)) => {
+                if copy.active {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => copy.scroll += 3,
+                        MouseEventKind::ScrollDown => {
+                            copy.scroll = copy.scroll.saturating_sub(3);
+                        }
+                        _ => {}
+                    }
+                    needs_draw = true;
+                    continue;
+                }
                 if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                     let st = state.lock().unwrap();
                     let mut hit = None;
@@ -303,6 +503,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(Event::Resize(c, r)) => {
+                if copy.active {
+                    copy.active = false;
+                    if let Ok(mut st) = state.lock() {
+                        st.resume_pane();
+                    }
+                }
                 let _ = writeln!(
                     writer,
                     "{}",
@@ -324,7 +530,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-fn render(f: &mut Frame, st: &ClientState, prefix_active: bool) {
+fn render(f: &mut Frame, st: &ClientState, prefix_active: bool, copy: &CopyMode) {
     let area = f.area();
     let tab = match st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
         Some(t) => t,
@@ -341,23 +547,38 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool) {
             rect.height.saturating_sub(2),
         );
 
+        let is_copy_pane = copy.active && copy.pane_id == pane.id;
+        let sel = if is_copy_pane { copy.start } else { None };
+        let cur = if is_copy_pane {
+            Some((copy.cursor_row, copy.cursor_col))
+        } else {
+            None
+        };
+
         if let Some(pp) = st.parsers.get(&pane.id) {
             let screen = pp.parser.screen();
             let lines: Vec<Line> = (0..inner.height)
-                .map(|row| build_line(screen, row, inner.width))
+                .map(|row| build_line(screen, row, inner.width, sel, cur))
                 .collect();
             f.render_widget(Paragraph::new(lines), inner);
 
-            if pane.id == tab.focused && !screen.hide_cursor() {
+            if !is_copy_pane && pane.id == tab.focused && !screen.hide_cursor() {
                 let (cr, cc) = screen.cursor_position();
                 if cr < inner.height && cc < inner.width {
                     f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
                 }
+            } else if is_copy_pane && copy.cursor_row < inner.height && copy.cursor_col < inner.width {
+                f.set_cursor_position(Position::new(
+                    inner.x + copy.cursor_col,
+                    inner.y + copy.cursor_row,
+                ));
             }
         }
 
         let is_focused = pane.id == tab.focused;
-        let border = if is_focused {
+        let border = if is_copy_pane {
+            Color::Yellow
+        } else if is_focused {
             Color::Cyan
         } else {
             Color::DarkGray
@@ -382,9 +603,19 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool) {
         .iter()
         .position(|p| p.id == tab.focused)
         .unwrap_or(0);
-    let (text, bg) = if prefix_active {
+
+    let (text, bg) = if copy.active {
+        let sel = if copy.start.is_some() { " [SELECTING] " } else { "" };
         (
-            " PREFIX: c=new-tab n/p=next/prev %/\"=split x=close d=detach Esc ".to_string(),
+            format!(
+                " COPY MODE{} | Line {}:{} | Space=select Enter=copy q=exit ",
+                sel, copy.cursor_row, copy.cursor_col
+            ),
+            Color::Yellow,
+        )
+    } else if prefix_active {
+        (
+            " PREFIX: c=new n/p=next %/\"=split x=close [=copy d=detach ".to_string(),
             Color::Yellow,
         )
     } else {
@@ -411,10 +642,31 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool) {
     );
 }
 
-fn build_line(screen: &vt100::Screen, row: u16, width: u16) -> Line<'static> {
+fn build_line(
+    screen: &vt100::Screen,
+    row: u16,
+    width: u16,
+    sel: Option<(u16, u16)>,
+    cur: Option<(u16, u16)>,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur_style: Option<Style> = None;
     let mut cur_text = String::new();
+
+    let (sel_sr, sel_sc, sel_er, sel_ec) = if let Some((sr, sc)) = sel {
+        if let Some((cr, cc)) = cur {
+            if (sr, sc) <= (cr, cc) {
+                (sr, sc, cr, cc)
+            } else {
+                (cr, cc, sr, sc)
+            }
+        } else {
+            (sr, sc, sr, sc)
+        }
+    } else {
+        (0, 0, 0, 0)
+    };
+
     for col in 0..width {
         let Some(cell) = screen.cell(row, col) else {
             continue;
@@ -423,7 +675,26 @@ fn build_line(screen: &vt100::Screen, row: u16, width: u16) -> Line<'static> {
         if text.is_empty() {
             continue;
         }
-        let style = cell_style(cell);
+        let mut style = cell_style(cell);
+
+        // Подсветка выделения
+        if sel.is_some() {
+            let in_sel = if row > sel_sr && row < sel_er {
+                true
+            } else if row == sel_sr && row == sel_er {
+                col >= sel_sc && col <= sel_ec
+            } else if row == sel_sr {
+                col >= sel_sc
+            } else if row == sel_er {
+                col <= sel_ec
+            } else {
+                false
+            };
+            if in_sel {
+                style = style.bg(Color::Blue).fg(Color::White);
+            }
+        }
+
         if Some(style) == cur_style {
             cur_text.push_str(&text);
         } else {
@@ -465,4 +736,36 @@ fn to_ratatui_color(c: VtColor) -> Color {
         VtColor::Idx(i) => Color::Indexed(i),
         VtColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
+}
+
+fn extract_selection(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> String {
+    let (sr, sc, er, ec) = if start <= end {
+        (start.0, start.1, end.0, end.1)
+    } else {
+        (end.0, end.1, start.0, start.1)
+    };
+    let mut result = String::new();
+    for row in sr..=er {
+        let row_start = if row == sr { sc } else { 0 };
+        let row_end = if row == er { ec } else { 65535 };
+        for col in row_start..=row_end {
+            if let Some(cell) = screen.cell(row, col) {
+                let c = cell.contents();
+                if !c.is_empty() {
+                    result.push_str(&c);
+                }
+            } else {
+                break;
+            }
+        }
+        if row < er {
+            result.push('\n');
+        }
+    }
+    result
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(text).map_err(|e| e.to_string())
 }
