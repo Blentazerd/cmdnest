@@ -46,6 +46,8 @@ pub enum ClientMsg {
     FocusPane { dir: NavDirP },
     ResizePane { dir: ResizeDirP },
     SetFocus { pane_id: u64 },
+    ZoomPane,
+    UnzoomPane,
 
 }
 
@@ -68,14 +70,22 @@ pub struct TabSnap {
     pub id: u64,
     pub focused: u64,
     pub panes: Vec<PaneSnap>,
+    pub zoomed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+
+
+
 pub struct PaneSnap {
     pub id: u64,
     pub rect: RectS,
     pub history: Vec<u8>,
+    pub hidden: bool,
 }
+
+
+
 
 pub fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());

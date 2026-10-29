@@ -17,6 +17,8 @@ struct PaneData {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     _child: Box<dyn Child + Send + Sync>,
     history: Arc<Mutex<Vec<u8>>>,
+    reader_started: bool,
+
 }
 
 struct TabData {
@@ -24,7 +26,10 @@ struct TabData {
     layout: Layout,
     panes: HashMap<u64, PaneData>,
     focused: u64,
+    zoomed: bool,
 }
+
+
 
 impl TabData {
     fn resize_all(&mut self, area: Rect) {
@@ -32,8 +37,21 @@ impl TabData {
         self.layout.compute(area, &mut rects);
         for (id, rect) in &rects {
             if let Some(p) = self.panes.get(id) {
-                let rows = rect.height.saturating_sub(2).max(1);
-                let cols = rect.width.saturating_sub(2).max(1);
+                let (rows, cols) = if self.zoomed {
+                    if *id == self.focused {
+                        (
+                            area.height.saturating_sub(2).max(1),
+                            area.width.saturating_sub(2).max(1),
+                        )
+                    } else {
+                        (1, 1)
+                    }
+                } else {
+                    (
+                        rect.height.saturating_sub(2).max(1),
+                        rect.width.saturating_sub(2).max(1),
+                    )
+                };
                 let _ = p.master.lock().unwrap().resize(PtySize {
                     rows,
                     cols,
@@ -44,21 +62,34 @@ impl TabData {
         }
     }
 
+
+
+
     fn snapshot(&self, area: Rect) -> TabSnap {
         let mut rects = Vec::new();
         self.layout.compute(area, &mut rects);
         let panes = rects
             .into_iter()
             .filter_map(|(id, r)| {
+                let (effective, hidden) = if self.zoomed {
+                    if id == self.focused {
+                        (Rect::new(0, 0, area.width, area.height), false)
+                    } else {
+                        (r, true)
+                    }
+                } else {
+                    (r, false)
+                };
                 self.panes.get(&id).map(|p| PaneSnap {
                     id,
                     rect: RectS {
-                        x: r.x,
-                        y: r.y,
-                        w: r.width,
-                        h: r.height,
+                        x: effective.x,
+                        y: effective.y,
+                        w: effective.width,
+                        h: effective.height,
                     },
                     history: p.history.lock().unwrap().clone(),
+                    hidden,
                 })
             })
             .collect();
@@ -66,9 +97,16 @@ impl TabData {
             id: self.id,
             focused: self.focused,
             panes,
+            zoomed: self.zoomed,
         }
     }
+
+
+
+
 }
+
+
 
 struct State {
     tabs: Vec<TabData>,
@@ -138,12 +176,17 @@ fn create_pane(
 
     Ok((
         id,
+
+
         PaneData {
             writer,
             master,
             _child: child,
             history,
+            reader_started: false,
         },
+
+
     ))
 }
 
@@ -175,6 +218,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             m
         },
         focused: first_id,
+        zoomed: false,
+
     };
 
     let state = Arc::new(Mutex::new(State {
@@ -189,72 +234,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // PTY readers
-    {
+
+
+
+
+
+    // Запуск readers для всех панелей первого tab'а
+    let initial_panes: Vec<(u64, u64)> = {
         let s = state.lock().unwrap();
-        for tab in &s.tabs {
-            for (pane_id, pane) in &tab.panes {
-                let reader = pane.master.lock().unwrap().try_clone_reader();
-                if let Ok(mut r) = reader {
-                    let hist = Arc::clone(&pane.history);
-                    let state_c = Arc::clone(&state);
-                    let tab_id = tab.id;
-                    let pid = *pane_id;
-                    thread::spawn(move || {
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            match r.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    let data = buf[..n].to_vec();
-                                    {
-                                        let mut h = hist.lock().unwrap();
-                                        h.extend_from_slice(&data);
-                                        if h.len() > HISTORY_LIMIT {
-                                            let ex = h.len() - HISTORY_LIMIT;
-                                            h.drain(0..ex);
-                                        }
-                                    }
-                                    let msg = serde_json::to_string(&ServerMsg::PaneOutput {
-                                        tab: tab_id,
-                                        pane: pid,
-                                        data,
-                                    })
-                                    .unwrap();
-                                   
-
-
-
-                                    let clients: Vec<(usize, Arc<Mutex<UnixStream>>)> = {
-                                        let st = state_c.lock().unwrap();
-                                        st.clients.iter().map(|(k, v)| (*k, v.clone())).collect()
-                                    };
-                                    let mut dead = Vec::new();
-                                    for (id, w) in &clients {
-                                        if let Ok(mut s) = w.lock() {
-                                            if writeln!(*s, "{}", msg).is_err() {
-                                                dead.push(*id);
-                                            }
-                                        } else {
-                                            dead.push(*id);
-                                        }
-                                    }
-                                    if !dead.is_empty() {
-                                        let mut st = state_c.lock().unwrap();
-                                        for id in dead {
-                                            st.clients.remove(&id);
-                                        }
-                                    }
-
-
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    });
-                }
-            }
-        }
+        s.tabs
+            .iter()
+            .flat_map(|t| t.panes.keys().map(move |pid| (t.id, *pid)))
+            .collect()
+    };
+    for (tid, pid) in initial_panes {
+        spawn_pty_reader(Arc::clone(&state), tid, pid);
     }
+
+
+
+
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -270,6 +269,73 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+fn spawn_pty_reader(state: Arc<Mutex<State>>, tab_id: u64, pane_id: u64) {
+    let (reader_opt, history) = {
+        let mut st = state.lock().unwrap();
+        let Some(tab) = st.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if pane.reader_started {
+            return;
+        }
+        pane.reader_started = true;
+        let reader = pane.master.lock().unwrap().try_clone_reader();
+        (reader, Arc::clone(&pane.history))
+    };
+    let Ok(mut r) = reader_opt else { return };
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    {
+                        let mut h = history.lock().unwrap();
+                        h.extend_from_slice(&data);
+                        if h.len() > HISTORY_LIMIT {
+                            let ex = h.len() - HISTORY_LIMIT;
+                            h.drain(0..ex);
+                        }
+                    }
+                    let msg = serde_json::to_string(&ServerMsg::PaneOutput {
+                        tab: tab_id,
+                        pane: pane_id,
+                        data,
+                    })
+                    .unwrap();
+                    let clients: Vec<(usize, Arc<Mutex<UnixStream>>)> = {
+                        let st = state.lock().unwrap();
+                        st.clients.iter().map(|(k, v)| (*k, v.clone())).collect()
+                    };
+                    let mut dead = Vec::new();
+                    for (id, w) in &clients {
+                        if let Ok(mut s) = w.lock() {
+                            if writeln!(*s, "{}", msg).is_err() {
+                                dead.push(*id);
+                            }
+                        } else {
+                            dead.push(*id);
+                        }
+                    }
+                    if !dead.is_empty() {
+                        let mut st = state.lock().unwrap();
+                        for id in dead {
+                            st.clients.remove(&id);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+
 
 fn handle_client(
     stream: UnixStream,
@@ -344,18 +410,32 @@ fn handle_client(
                 st.next_tab_id += 1;
                 let mut m = HashMap::new();
                 m.insert(pid, pane);
+
+
+
+
                 let mut tab = TabData {
                     id: tid,
                     layout: Layout::leaf(pid),
                     panes: m,
                     focused: pid,
+                    zoomed: false,
                 };
+
+
+
                 tab.resize_all(area);
+
+
                 st.tabs.push(tab);
                 st.active = tid;
                 drop(st);
+                spawn_pty_reader(Arc::clone(&state), tid, pid);
                 let st = state.lock().unwrap();
                 st.broadcast_snapshot();
+
+
+
             }
             ClientMsg::NextTab => {
                 if let Some(idx) = st.tabs.iter().position(|t| t.id == st.active) {
@@ -402,7 +482,12 @@ fn handle_client(
                 let (new_pid, new_pane) = create_pane(&mut npid, 1, 1)?;
                 st.next_pane_id = npid;
                 let active_id = st.active;
+
+
+
+
                 if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == active_id) {
+                    tab.zoomed = false;
                     if tab.layout.split_at(tab.focused, new_pid, split_dir) {
                         tab.panes.insert(new_pid, new_pane);
                         tab.focused = new_pid;
@@ -411,9 +496,18 @@ fn handle_client(
                     }
                 }
                 drop(st);
+                spawn_pty_reader(Arc::clone(&state), active_id, new_pid);
                 let st = state.lock().unwrap();
                 st.broadcast_snapshot();
+
+
+
+
+
             }
+
+
+
             ClientMsg::ClosePane => {
                 let active_id = st.active;
                 if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == active_id) {
@@ -428,6 +522,10 @@ fn handle_client(
                 let st = state.lock().unwrap();
                 st.broadcast_snapshot();
             }
+
+
+
+
             ClientMsg::FocusPane { dir } => {
                 let area = st.main_area();
                 let nd = match dir {
@@ -465,17 +563,70 @@ fn handle_client(
                 let st = state.lock().unwrap();
                 st.broadcast_snapshot();
             }
+
+
+
+
+
             ClientMsg::SetFocus { pane_id } => {
                 let active_id = st.active;
+                let area = st.main_area();
                 if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == active_id) {
                     if tab.panes.contains_key(&pane_id) {
                         tab.focused = pane_id;
+                        if tab.zoomed {
+                            tab.resize_all(area);
+                        }
                     }
                 }
                 drop(st);
                 let st = state.lock().unwrap();
                 st.broadcast_snapshot();
             }
+
+
+
+
+
+
+
+            ClientMsg::ZoomPane => {
+                let active_id = st.active;
+                let area = st.main_area();
+                if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == active_id) {
+                    if !tab.zoomed {
+                        tab.zoomed = true;
+                        tab.resize_all(area);
+                    }
+                }
+                drop(st);
+                let st = state.lock().unwrap();
+                st.broadcast_snapshot();
+            }
+
+
+
+
+
+
+            ClientMsg::UnzoomPane => {
+                let active_id = st.active;
+                let area = st.main_area();
+                if let Some(tab) = st.tabs.iter_mut().find(|t| t.id == active_id) {
+                    if tab.zoomed {
+                        tab.zoomed = false;
+                        tab.resize_all(area);
+                    }
+                }
+                drop(st);
+                let st = state.lock().unwrap();
+                st.broadcast_snapshot();
+            }
+
+
+
+
+
         }
     }
 

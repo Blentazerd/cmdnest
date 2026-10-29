@@ -373,9 +373,37 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // ---- Prefix ----
+
+
+
                 if prefix_active {
                     prefix_active = false;
+
+                    // Zoom — только отправляем сообщение серверу
+                    if key.code == KeyCode::Char('z') {
+                        let st = state.lock().unwrap();
+                        let zoomed = st
+                            .snap
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == st.snap.active)
+                            .map(|t| t.zoomed)
+                            .unwrap_or(false);
+                        drop(st);
+                        let m = if zoomed {
+                            ClientMsg::UnzoomPane
+                        } else {
+                            ClientMsg::ZoomPane
+                        };
+                        let _ = writeln!(writer, "{}", serde_json::to_string(&m)?);
+                        needs_draw = true;
+                        continue;
+                    }
+
                     let msg = match key.code {
+
+
+
                         KeyCode::Char('d') => Some(ClientMsg::Detach),
                         KeyCode::Char('c') => Some(ClientMsg::NewTab),
                         KeyCode::Char('n') => Some(ClientMsg::NextTab),
@@ -479,8 +507,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                     let st = state.lock().unwrap();
                     let mut hit = None;
+
+
+
+
+
                     if let Some(tab) = st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
                         for p in &tab.panes {
+                            if p.hidden {
+                                continue;
+                            }
                             let r = p.rect;
                             if m.column >= r.x
                                 && m.column < r.x + r.w
@@ -492,6 +528,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+
+
+
+
+
                     drop(st);
                     if let Some(pid) = hit {
                         let _ = writeln!(
@@ -530,6 +571,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+
+
+
 fn render(f: &mut Frame, st: &ClientState, prefix_active: bool, copy: &CopyMode) {
     let area = f.area();
     let tab = match st.snap.tabs.iter().find(|t| t.id == st.snap.active) {
@@ -537,59 +581,23 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool, copy: &CopyMode)
         None => return,
     };
 
+
+
+
     for pane in &tab.panes {
-        let r = pane.rect;
-        let rect = Rect::new(r.x, r.y, r.w, r.h);
-        let inner = Rect::new(
-            rect.x + 1,
-            rect.y + 1,
-            rect.width.saturating_sub(2),
-            rect.height.saturating_sub(2),
-        );
-
-        let is_copy_pane = copy.active && copy.pane_id == pane.id;
-        let sel = if is_copy_pane { copy.start } else { None };
-        let cur = if is_copy_pane {
-            Some((copy.cursor_row, copy.cursor_col))
-        } else {
-            None
-        };
-
-        if let Some(pp) = st.parsers.get(&pane.id) {
-            let screen = pp.parser.screen();
-            let lines: Vec<Line> = (0..inner.height)
-                .map(|row| build_line(screen, row, inner.width, sel, cur))
-                .collect();
-            f.render_widget(Paragraph::new(lines), inner);
-
-            if !is_copy_pane && pane.id == tab.focused && !screen.hide_cursor() {
-                let (cr, cc) = screen.cursor_position();
-                if cr < inner.height && cc < inner.width {
-                    f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
-                }
-            } else if is_copy_pane && copy.cursor_row < inner.height && copy.cursor_col < inner.width {
-                f.set_cursor_position(Position::new(
-                    inner.x + copy.cursor_col,
-                    inner.y + copy.cursor_row,
-                ));
-            }
+        if pane.hidden {
+            continue;
         }
-
+        let rect = Rect::new(pane.rect.x, pane.rect.y, pane.rect.w, pane.rect.h);
         let is_focused = pane.id == tab.focused;
-        let border = if is_copy_pane {
-            Color::Yellow
-        } else if is_focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-        f.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-            rect,
-        );
+        render_pane(f, st, pane, rect, is_focused, copy);
     }
+
+
+
+
+
+
 
     let status_area = Rect::new(0, area.height.saturating_sub(1), area.width, 1);
     let tab_idx = st
@@ -615,13 +623,15 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool, copy: &CopyMode)
         )
     } else if prefix_active {
         (
-            " PREFIX: c=new n/p=next %/\"=split x=close [=copy d=detach ".to_string(),
+            " PREFIX: c=new n/p=next %/\"=split x=close [=copy z=zoom d=detach ".to_string(),
             Color::Yellow,
         )
     } else {
+        let zoom_tag = if tab.zoomed { "[ZOOM] " } else { "" };
         (
             format!(
-                " Tab {}/{} | Pane {}/{} | C-b: prefix | Ctrl+Q: exit ",
+                " {}Tab {}/{} | Pane {}/{} | C-b: prefix | Ctrl+Q: exit ",
+                zoom_tag,
                 tab_idx + 1,
                 st.snap.tabs.len(),
                 pane_idx + 1,
@@ -641,6 +651,68 @@ fn render(f: &mut Frame, st: &ClientState, prefix_active: bool, copy: &CopyMode)
         status_area,
     );
 }
+
+fn render_pane(
+    f: &mut Frame,
+    st: &ClientState,
+    pane: &PaneSnap,
+    rect: Rect,
+    is_focused: bool,
+    copy: &CopyMode,
+) {
+    let inner = Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    );
+
+    let is_copy_pane = copy.active && copy.pane_id == pane.id;
+    let sel = if is_copy_pane { copy.start } else { None };
+    let cur = if is_copy_pane {
+        Some((copy.cursor_row, copy.cursor_col))
+    } else {
+        None
+    };
+
+    if let Some(pp) = st.parsers.get(&pane.id) {
+        let screen = pp.parser.screen();
+        let lines: Vec<Line> = (0..inner.height)
+            .map(|row| build_line(screen, row, inner.width, sel, cur))
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+
+        if !is_copy_pane && is_focused && !screen.hide_cursor() {
+            let (cr, cc) = screen.cursor_position();
+            if cr < inner.height && cc < inner.width {
+                f.set_cursor_position(Position::new(inner.x + cc, inner.y + cr));
+            }
+        } else if is_copy_pane && copy.cursor_row < inner.height && copy.cursor_col < inner.width
+        {
+            f.set_cursor_position(Position::new(
+                inner.x + copy.cursor_col,
+                inner.y + copy.cursor_row,
+            ));
+        }
+    }
+
+    let border = if is_copy_pane {
+        Color::Yellow
+    } else if is_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border)),
+        rect,
+    );
+}
+
+
+
 
 fn build_line(
     screen: &vt100::Screen,
